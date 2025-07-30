@@ -1,49 +1,160 @@
 import numpy as np
 import collections
 from scipy.sparse import csr_matrix
-from scipy.optimize import minimize
+from scipy.optimize import minimize,linprog
 from scipy.sparse.linalg import svds
 import gurobipy as gp
-from sklearn.decomposition import PCA
-
 from typing import Optional, Tuple, List
 import time
-from sentence_transformers import SentenceTransformer
-from sentence_transformers.util import normalize_embeddings
+from stable_lottery_ours import find_stable_lottery, check_stable_lottery,compute_lslr_candidate_distribution,get_SaW_count
 
 
+def is_uniform_vector_in_convex_hull(d: int, vectors):
+   
+    
+    target_vector = np.full(d, 1.0 / d)
+    np_vectors = np.array(vectors)
 
-opinions = [
-            "I believe that abortion should be legal and accessible because women have the right to make decisions about their own bodies. Access to safe abortions is crucial for protecting women’s health and well-being. Society should support comprehensive sex education and contraception to reduce the need for abortions.",
-            "I think abortion should be a personal decision between a woman and her doctor, without government interference. Each situation is unique, and women should have the autonomy to make the best choice for themselves and their families. Society should ensure that all women have access to affordable healthcare, including reproductive services.",
-            "I believe that abortion should be allowed in the first trimester but restricted afterward unless there are exceptional circumstances. This policy respects a woman’s right to choose while recognizing the increasing moral considerations as the pregnancy progresses. Society should invest in education and healthcare to prevent unwanted pregnancies and support women through their reproductive choices.",
-            "I think abortion should be restricted to certain circumstances, such as cases of rape, incest, or when the mother’s life is at risk. This approach balances the rights of the unborn with the needs of women facing difficult situations. Society should provide support for women who carry their pregnancies to term, including healthcare and financial assistance.",
-            "I believe that abortion should be illegal because it involves taking a human life, which I consider morally wrong. Society should focus on providing resources and support for pregnant women to encourage them to choose life. Adoption should be promoted as a viable alternative to abortion."
-        ]
+    
+    # 'num_vectors' is the count of the input vectors provided.
+    num_vectors = np_vectors.shape[0]
+    c = np.zeros(num_vectors)
+    A_eq = np.zeros((d + 1, num_vectors))
+    b_eq = np.zeros(d + 1)
 
-def language_embeddings(opinions,d):
-    model_name = "tomaarsen/mpnet-base-nli-matryoshka" # A good choice specifically optimized for 64
+    for dim_idx in range(d):
+        A_eq[dim_idx, :] = np_vectors[:, dim_idx]
+        b_eq[dim_idx] = target_vector[dim_idx]
+   
+    A_eq[d, :] = 1.0
+    b_eq[d] = 1.0
+    
 
-    print(f"Loading model: {model_name}...")
-    model = SentenceTransformer(model_name)
-    print("Model loaded.")
-
-    # Define the desired target dimension for truncation
-    target_dimension =768 #64
-
-    # 2. Encode the alternatives with the specified truncation dimension
-    print(f"Deco alternatives to {d} dimensions...")
-    embeddings_mrl = model.encode(opinions)[:, :target_dimension]
-    pca = PCA(n_components=d)
-    principal_components = pca.fit_transform(embeddings_mrl)
-
-    #return embeddings_mrl
-    print("principal_components",principal_components)
-    return principal_components
+    bounds = [(0.0, None)] * num_vectors
+    res = linprog(c, A_eq=A_eq, b_eq=b_eq, bounds=bounds, method='highs')
+    return res.success and (np.isclose(res.fun, 0.0)).all()
 
 
+def load_and_sample_movielens_data(
+    data_path,
+    n_to_sample=None,
+    m_to_sample=None,
+    random_seed=None
+):
+    """
+    Loads MovieLens dataset and creates a sparse user-item rating matrix,
+    optionally sampling a subset of users and items.
 
+    Args:
+        data_path (str): Path to the MovieLens u.data file.
+        num_users_to_sample (int, optional): Number of users to sample. If None, use all.
+        num_items_to_sample (int, optional): Number of items to sample. If None, use all.
+        random_seed (int, optional): Seed for random number generation for reproducibility.
 
+    Returns:
+        tuple: (rating_matrix, user_mapping, item_mapping)
+            rating_matrix (scipy.sparse.csr_matrix): The sparse user-item rating matrix.
+            user_mapping (dict): Maps original user_id to new 0-based index.
+            item_mapping (dict): Maps original item_id to new 0-based index.
+    """
+    if random_seed is not None:
+        np.random.seed(random_seed)
+
+    sampled_users_found = False
+    attempts = 0
+    selected_item_ids_set = set() # Final set of items after filtering
+    final_sampled_user_ids_list = [] # List of original user IDs actually used
+    max_user_sampling_attempts = 5
+
+    while not sampled_users_found and attempts < max_user_sampling_attempts:
+        attempts += 1
+        if attempts > 1: # Only print this on subsequent attempts
+            print(f"  Attempt {attempts}/{max_user_sampling_attempts}: Resampling users...")
+        else:
+            print(f"  Attempt {attempts}/{max_user_sampling_attempts}: Sampling {n_to_sample} users...")
+        
+        # Sample n_target user IDs
+        current_sampled_user_ids_list = np.random.choice(range(1, 2000), n_to_sample, replace=False)
+        #print("current_sampled_user_ids", current_sampled_user_ids_list, max(current_sampled_user_ids_list))
+        current_sampled_user_ids_set = set(current_sampled_user_ids_list) # For efficient lookup
+
+        # --- Pass 2: Collect ratings only for the current sampled users ---
+        # This is memory-efficient as it only stores relevant ratings.
+        current_collected_ratings = [] # List of (user_id, item_id, rating) tuples
+        item_review_counts = collections.defaultdict(int) # To count reviews per item for filtering
+
+        with open(data_path, 'r') as f:
+            for line in f:
+                try:
+                    parts = line.strip().split(",")
+                    user_id, item_id, rating = int(parts[0]), int(parts[1]), float(parts[2])
+                    if user_id in current_sampled_user_ids_set:
+                        current_collected_ratings.append((user_id, item_id, rating))
+                        item_review_counts[item_id] += 1
+                    if user_id> max(current_sampled_user_ids_list):
+                        break
+
+                except ValueError:
+                    continue # Skip malformed lines
+
+        unique_items_rated_by_current_sample = set(item_id for _, item_id, _ in current_collected_ratings)
+
+        if len(unique_items_rated_by_current_sample) >= m_to_sample:
+            # We have enough items. Now select the top 'm_target' items by review count.
+            sorted_items_by_review_count = sorted(
+                item_review_counts.items(), 
+                key=lambda item: item[1], 
+                reverse=True
+            )
+            selected_item_ids_list = [item_id for item_id, _ in sorted_items_by_review_count[:m_to_sample]]
+            selected_item_ids_set = set(selected_item_ids_list)
+
+            sampled_users_found = True # Break out of the while loop
+            final_sampled_user_ids_list = current_sampled_user_ids_list
+            print(f"  Found {len(unique_items_rated_by_current_sample)} unique items rated by sampled users. Selected top {m_to_sample} items.")
+        else:
+            print(f"  Only {len(unique_items_rated_by_current_sample)} unique items rated by current user sample, less than target {m_to_sample}.")
+            if attempts == max_user_sampling_attempts:
+                print(f"Warning: Max user sampling attempts reached. Proceeding with all available items ({len(unique_items_rated_by_current_sample)}) and users from the last sample.")
+                selected_item_ids_set = unique_items_rated_by_current_sample
+                final_sampled_user_ids_list = current_sampled_user_ids_list
+                sampled_users_found = True # Force exit after last attempt
+            # Else, loop continues to try a new user sample
+
+    if not sampled_users_found: # Should only happen if max_user_sampling_attempts was 0
+        raise ValueError("Could not find a suitable user sample. Adjust N, M, or max_user_sampling_attempts.")
+
+    # --- Construct final sparse matrix from selected users and items ---
+    
+    # Create compact 0-based mappings for the final selected users and items
+    user_to_idx = {user_id: idx for idx, user_id in enumerate(final_sampled_user_ids_list)}
+    item_to_idx = {item_id: idx for idx, item_id in enumerate(list(selected_item_ids_set))} # Convert to list for consistent order
+
+    rows, cols, data = [], [], []
+    num_ratings_processed = 0
+
+    # Filter collected ratings to include only the final selected items
+    for user_id, item_id, rating in current_collected_ratings:
+        if user_id in user_to_idx and item_id in item_to_idx: # Check if both are in our final selection
+            rows.append(user_to_idx[user_id])
+            cols.append(item_to_idx[item_id])
+            data.append(rating)
+            num_ratings_processed += 1
+
+    num_users_actual = len(user_to_idx)
+    num_items_actual = len(item_to_idx)
+    
+    # Handle cases where no ratings exist after aggressive filtering
+    if not rows:
+        print("Warning: No ratings found for the sampled users and items. Returning empty matrix.")
+        return csr_matrix((0,0)), {}, {}
+
+    rating_matrix = csr_matrix((data, (rows, cols)), shape=(num_users_actual, num_items_actual))
+    sparsity = 1 - rating_matrix.nnz / (num_users_actual * num_items_actual)
+    print(f"  Final sampled matrix: {num_users_actual} users, {num_items_actual} items, {rating_matrix.nnz} ratings.")
+    print(f"  Sparsity: {sparsity:.4f}")
+    
+    return rating_matrix, user_to_idx, item_to_idx, sparsity
 
 def learn_l1_normalized_vector(item_embeddings, utility_vector):
     """
@@ -138,17 +249,35 @@ class Instance:
 
         self.generate_instance(noisy_matrix)
         self.warm_start() # Initialize the Gurobi model for theoretical feasibility checks
-        print("each candidate's utility is", self.total_utilities_per_candidate)
         
     def generate_instance(self, noisy_matrix: csr_matrix):
+        """
+        Generates user and item embeddings from the noisy_matrix using SVD,
+        and then constructs the utility matrix and identifies the optimal candidate.
 
-        item_embeddings=language_embeddings(opinions,self.d)
+        Args:
+            noisy_matrix (csr_matrix): The sparse rating matrix.
+        """
+        # Ensure noisy_matrix is dense for SVD if it's too sparse for direct sparse SVD
+        # svds works well with sparse matrices, but for smaller k and specific algorithms,
+        # converting to dense might be an option if svds struggles.
+        # However, for typical recommendations, keep it sparse.
+        
+        # SVD can sometimes fail if k is too large for the matrix's effective rank or if matrix is very small.
+        # Ensure k <= min(num_users, num_items) - 1 for svds
+
+        U, s, Vt = svds(noisy_matrix, self.d)
+        
+        # Reconstruct utility matrix (optional, for comparison/debug)
+        # Note: reconstructed_utility will be (num_users, num_items) from the SVD approximation
+        reconstructed_utility = U @ np.diag(s) @ Vt
+        #user_embeddings_svd = U @ np.diag(np.sqrt(s))
+        item_embeddings_svd = Vt.T @ np.diag(np.sqrt(s))
 
         # L1 normalization for item embeddings and ensure positive entries
-        min_val_item = np.min(item_embeddings)
-        
+        min_val_item = np.min(item_embeddings_svd)
         # Shift to make all values non-negative before L1 normalization
-        item_embeddings_shifted = item_embeddings - min_val_item if min_val_item < 0 else item_embeddings
+        item_embeddings_shifted = item_embeddings_svd - min_val_item if min_val_item < 0 else item_embeddings_svd
         item_embeddings_normalized = np.zeros_like(item_embeddings_shifted)
 
         for i, embedding in enumerate(item_embeddings_shifted):
@@ -166,12 +295,11 @@ class Instance:
         # For each user, their utility vector is a row from the reconstructed_utility matrix.
         # The `learn_l1_normalized_vector` function expects a single user's utility vector.
         learned_user_embeddings = []
-        reconstructed_utility = (1/6) * np.array(noisy_matrix)
         for i in range(self.n):
             # Pass the item_embeddings_normalized to the learning function
             # and the i-th row of the reconstructed_utility (which represents user i's utility for all items).
             if reconstructed_utility.shape[0] > i:
-                user_util_vector = reconstructed_utility[i, :] 
+                user_util_vector = 0.2*reconstructed_utility[i, :] #since the original rating is 1-5.
                 learned_v = learn_l1_normalized_vector(self.candidates, user_util_vector)
                 if learned_v is not None:
                     learned_user_embeddings.append(learned_v)
@@ -190,10 +318,9 @@ class Instance:
         self.utilities = self.voters @ self.candidates.T
 
         # Determine the socially optimal candidate (c_star) and its welfare
-        self.total_utilities_per_candidate = np.sum(self.utilities, axis=0)
-        
-        self.c_star = self.candidates[np.argmax(self.total_utilities_per_candidate)]
-        self.max_social_welfare = np.max(self.total_utilities_per_candidate)
+        total_utilities_per_candidate = np.sum(self.utilities, axis=0)
+        self.c_star = self.candidates[np.argmax(total_utilities_per_candidate)]
+        self.max_social_welfare = np.max(total_utilities_per_candidate)
         print("we have finished generating the instnace.")
 
     def warm_start(self):
@@ -230,9 +357,9 @@ class Instance:
                 name=f"voter{k}_l1_norm"
             )
 
-            
+            '''
             ##cone conditions
-            ''' for dim in range(self.d):
+            for dim in range(self.d):
                 model.addConstr(
                     self.v_vars[k, dim] == gp.quicksum(self.alpha_vars[k, j] * self.candidates[j, dim] for j in range(self.m)),
                     name=f"voter{k}_cone_dim{dim}"
@@ -241,8 +368,8 @@ class Instance:
             model.addConstr(
                 gp.quicksum(self.alpha_vars[k, j] for j in range(self.m)) == 1,
                 name=f"voter{k}_alpha_sum_to_1"
-            )'''
-            
+            )
+            '''
 
         # Add constraints to define vbar as the average of v_k vectors
         for dim in range(self.d):
@@ -274,6 +401,48 @@ class Instance:
         except gp.GurobiError as e:
             print(f"  Gurobi error during warm_start initial optimization: {e}")
             self.is_feasible_instance = False
+
+    def uniform_project(self):
+        # if the uniform candidate is in the convex hull, return it
+        # else, we minimize a weighted sum of the candidates to the uniform by its KL divergence
+        uniform_candidate = np.ones(self.d) / self.d  # Uniform distribution over d dimensions
+        # Check if the uniform candidate is in the convex hull of candidates
+        if is_uniform_vector_in_convex_hull(self.d, self.candidates):
+            self.uproj= uniform_candidate
+            return uniform_candidate
+        else:
+            # If not, we need to find the closest candidate to the uniform vector
+            # This can be done by minimizing the KL divergence or a similar metric
+            def objective_function(weights):
+                weighted_sum = np.sum(weights[:, None] * self.candidates, axis=0)
+                kl_divergence = np.sum( np.log(1 / weighted_sum))
+                return kl_divergence
+
+            # Initial guess: equal weights for all candidates
+            initial_weights = np.ones(self.m) / self.m
+            
+            # Constraints: weights must sum to 1 and be non-negative
+            constraints = {'type': 'eq', 'fun': lambda w: np.sum(w) - 1}
+            bounds = [(0, 1)] * self.m
+            
+            result = minimize(
+                fun=objective_function,
+                x0=initial_weights,
+                method='SLSQP',
+                bounds=bounds,
+                constraints=constraints,
+                options={'disp': False, 'maxiter': 1000, 'ftol': 1e-9}
+            )
+            
+            if result.success:
+                optimal_weights = result.x
+                closest_candidate = np.sum(optimal_weights[:, None] * self.candidates, axis=0)
+                self.uproj= closest_candidate
+                return closest_candidate
+            else:
+                print("Warning: Optimization failed to find a suitable candidate.")
+                return None
+
 
     def check_theoretical_feasibility_lp(
             self,
@@ -343,8 +512,7 @@ class Instance:
             return is_feasible_for_beta, current_basis
         else:
             return False, None
- 
-
+        
     def find_violated_among_candidate_reverse(self, beta_hat: float, c_chosen):
             violated_cuts_data = []
         
@@ -380,97 +548,6 @@ class Instance:
                     print(f"An unexpected error occurred during Gurobi optimization for c_k (index {k_idx}): {e}. Skipping this candidate.")
                     
             return violated_cuts_data    
-
-    def calculate_theoretical_distortion_unconstrained(self, c_chosen, max_iter=100, tolerance=1e-6, verbose=False):
-        master_theo_model = gp.Model("MasterLP")
-        master_theo_model.setParam('OutputFlag', 0)
-        master_theo_model.setParam('LogFile', '')
-        beta_var = master_theo_model.addVar(name="beta", lb=0.0, ub=1.0)
-        master_theo_model.setObjective(beta_var, gp.GRB.MAXIMIZE)
-        
-        optimal_beta = None  # Initialize optimal_beta
-        
-        for iteration in range(1, max_iter + 1):
-            if verbose:
-                print(f"\nIteration {iteration}: Solving Master Problem with {master_theo_model.NumConstrs} constraints...")
-            
-            try:
-                master_theo_model.optimize()
-                
-                if master_theo_model.status not in [gp.GRB.OPTIMAL, gp.GRB.INF_OR_UNBD, gp.GRB.UNBOUNDED]:
-                    print(f"Master problem failed to solve or is not optimal at iteration {iteration}: {master_theo_model.status}")
-                    return None
-                
-                # If master model is unbounded or infeasible, it's problematic
-                if master_theo_model.status == gp.GRB.INF_OR_UNBD or master_theo_model.status == gp.GRB.UNBOUNDED:
-                    print(f"Master problem is {master_theo_model.status} at iteration {iteration}. Returning None.")
-                    return None
-                
-                current_beta_hat = beta_var.X
-                if current_beta_hat is None:
-                    print(f"Solver returned None values at iteration {iteration}. Status: {master_theo_model.status}")
-                    return None
-                
-                if verbose:
-                    print(f"Master solution: beta_hat={current_beta_hat:.6f}")
-                
-                # Call the separation oracle to find violated constraints
-                # This will use the model (the other Gurobi model)
-                violated_cuts_data = self.find_violated_among_candidate_reverse(current_beta_hat, c_chosen)
-                
-                if not violated_cuts_data:
-                    if verbose:
-                        print("No violated constraints found. Optimal solution reached.")
-                    optimal_beta = current_beta_hat
-                    break
-                else:
-                    for v_star, c_k_violated in violated_cuts_data:
-                        # The cut is: <c_chosen, v_star> - beta_var * <c_k_violated, v_star> >= 0
-                        # This is a linear constraint in beta_var
-                        #lhs_constant = np.dot(c_chosen, v_star)
-                        #rhs_coeff = np.dot(c_k_violated, v_star)
-                        lhs_constant = np.dot(c_k_violated, v_star) #the new cut should be rhs_coeff* beta -<c_k,v> >=0
-                        rhs_coeff = np.dot(c_chosen, v_star)
-                       
-                        # Add the new constraint to the master problem
-                        # np.where is used to get the index of c_k_violated for naming the cut
-                        # This assumes candidates are unique for reliable indexing.
-                        c_k_idx = np.where((self.candidates == c_k_violated).all(axis=1))[0][0]
-                       # master_theo_model.addConstr(lhs_constant - beta_var * rhs_coeff >= 0,
-                        master_theo_model.addConstr( beta_var * rhs_coeff-lhs_constant >= 0,
-                                                name=f"cut_iter{iteration}_ck{c_k_idx}_v{iteration}")
-                    
-                    master_theo_model.update()
-                    
-                    if verbose:
-                        print(f"Found {len(violated_cuts_data)} new cut(s). Total cuts: {master_theo_model.NumConstrs}")
-            
-            except gp.GurobiError as e:
-                print(f"Gurobi Error in Master Problem at iteration {iteration}: {e}")
-                return None
-            except Exception as e:
-                print(f"An unexpected error occurred at iteration {iteration}: {e}")
-                return None
-        
-        else:
-            if verbose:
-                print(f"Maximum iterations ({max_iter}) reached without full convergence.")
-            # If we exit the loop without finding optimal solution, use the last beta value
-            if 'current_beta_hat' in locals():
-                optimal_beta = current_beta_hat
-            else:
-                print("No valid solution found.")
-                return None
-        
-        # Check if optimal_beta is valid before computing theoretical distortion
-        if optimal_beta is None or optimal_beta <= 0:
-            print(f"Invalid optimal_beta value: {optimal_beta}")
-            return None
-        
-        theoretical_distortion = 1 / optimal_beta
-        
-        return theoretical_distortion   
-    
 
     def find_violated_among_candidates(self, beta_hat: float, c_chosen):
             violated_cuts_data = []
@@ -562,6 +639,125 @@ class Instance:
                         # This assumes candidates are unique for reliable indexing.
                         c_k_idx = np.where((self.candidates == c_k_violated).all(axis=1))[0][0]
                         master_theo_model.addConstr(lhs_constant - beta_var * rhs_coeff >= 0,
+                                                name=f"cut_iter{iteration}_ck{c_k_idx}_v{iteration}")
+                    
+                    master_theo_model.update()
+                    
+                    if verbose:
+                        print(f"Found {len(violated_cuts_data)} new cut(s). Total cuts: {master_theo_model.NumConstrs}")
+            
+            except gp.GurobiError as e:
+                print(f"Gurobi Error in Master Problem at iteration {iteration}: {e}")
+                return None
+            except Exception as e:
+                print(f"An unexpected error occurred at iteration {iteration}: {e}")
+                return None
+        
+        else:
+            if verbose:
+                print(f"Maximum iterations ({max_iter}) reached without full convergence.")
+            # If we exit the loop without finding optimal solution, use the last beta value
+            if 'current_beta_hat' in locals():
+                optimal_beta = current_beta_hat
+            else:
+                print("No valid solution found.")
+                return None
+        
+        # Check if optimal_beta is valid before computing theoretical distortion
+        if optimal_beta is None or optimal_beta <= 0:
+            print(f"Invalid optimal_beta value: {optimal_beta}")
+            return None
+        
+        theoretical_distortion = 1 / optimal_beta
+        
+        return theoretical_distortion   
+
+    def compute_linear_stable_lottery(self):
+        output=np.zeros(self.d)
+        k_committee_size = int(np.sqrt(self.d))
+        found_lottery_committees, message_committees = find_stable_lottery(self.utilities, k_committee_size)
+
+        
+        print("\nFound Stable Lottery Distribution over Committees:")
+        for committee, prob in found_lottery_committees.items():
+            print(f"  Committee {committee}: Probability {prob:.4f}")
+
+            #print(f"\n--- Verifying the found committee lottery ---")
+            #is_stable_committees, verification_results_committees = check_stable_lottery(self.utilities, k_committee_size, found_lottery_committees)
+            #print(f"Is the found committee lottery stable? {is_stable_committees}")
+            #for alt, res in verification_results_committees.items():
+            #    print(f"  {alt}: Expected |S_a(W)| = {res['expected_SaW']:.4f}, Threshold = {res['threshold']:.4f}, Condition Met: {res['condition_met']}")
+
+
+        lslr_candidates, lslr_message = compute_lslr_candidate_distribution(found_lottery_committees, self.m, k_committee_size)
+        
+        
+        for candidate_idx, prob in lslr_candidates.items():
+            print(f"  Candidate {candidate_idx}: Probability {prob:.4f}")
+            output+=prob*np.array(self.candidates[candidate_idx])
+        print(f"  Sum of candidate probabilities: {sum(lslr_candidates.values())==0.5}")
+        output+=0.5*self.uproj
+
+        return output
+
+
+    def calculate_theoretical_distortion_unconstrained(self, c_chosen, max_iter=100, tolerance=1e-6, verbose=False):
+        master_theo_model = gp.Model("MasterLP")
+        master_theo_model.setParam('OutputFlag', 0)
+        master_theo_model.setParam('LogFile', '')
+        beta_var = master_theo_model.addVar(name="beta", lb=0.0, ub=1.0)
+        master_theo_model.setObjective(beta_var, gp.GRB.MAXIMIZE)
+        
+        optimal_beta = None  # Initialize optimal_beta
+        
+        for iteration in range(1, max_iter + 1):
+            if verbose:
+                print(f"\nIteration {iteration}: Solving Master Problem with {master_theo_model.NumConstrs} constraints...")
+            
+            try:
+                master_theo_model.optimize()
+                
+                if master_theo_model.status not in [gp.GRB.OPTIMAL, gp.GRB.INF_OR_UNBD, gp.GRB.UNBOUNDED]:
+                    print(f"Master problem failed to solve or is not optimal at iteration {iteration}: {master_theo_model.status}")
+                    return None
+                
+                # If master model is unbounded or infeasible, it's problematic
+                if master_theo_model.status == gp.GRB.INF_OR_UNBD or master_theo_model.status == gp.GRB.UNBOUNDED:
+                    print(f"Master problem is {master_theo_model.status} at iteration {iteration}. Returning None.")
+                    return None
+                
+                current_beta_hat = beta_var.X
+                if current_beta_hat is None:
+                    print(f"Solver returned None values at iteration {iteration}. Status: {master_theo_model.status}")
+                    return None
+                
+                if verbose:
+                    print(f"Master solution: beta_hat={current_beta_hat:.6f}")
+                
+                # Call the separation oracle to find violated constraints
+                # This will use the model (the other Gurobi model)
+                violated_cuts_data = self.find_violated_among_candidate_reverse(current_beta_hat, c_chosen)
+                
+                if not violated_cuts_data:
+                    if verbose:
+                        print("No violated constraints found. Optimal solution reached.")
+                    optimal_beta = current_beta_hat
+                    break
+                else:
+                    for v_star, c_k_violated in violated_cuts_data:
+                        # The cut is: <c_chosen, v_star> - beta_var * <c_k_violated, v_star> >= 0
+                        # This is a linear constraint in beta_var
+                        #lhs_constant = np.dot(c_chosen, v_star)
+                        #rhs_coeff = np.dot(c_k_violated, v_star)
+                        lhs_constant = np.dot(c_k_violated, v_star) #the new cut should be rhs_coeff* beta -<c_k,v> >=0
+                        rhs_coeff = np.dot(c_chosen, v_star)
+                       
+                        # Add the new constraint to the master problem
+                        # np.where is used to get the index of c_k_violated for naming the cut
+                        # This assumes candidates are unique for reliable indexing.
+                        c_k_idx = np.where((self.candidates == c_k_violated).all(axis=1))[0][0]
+                       # master_theo_model.addConstr(lhs_constant - beta_var * rhs_coeff >= 0,
+                        master_theo_model.addConstr( beta_var * rhs_coeff-lhs_constant >= 0,
                                                 name=f"cut_iter{iteration}_ck{c_k_idx}_v{iteration}")
                     
                     master_theo_model.update()
@@ -1044,6 +1240,7 @@ class Instance:
         Calculates and prints distortion for a set of common social choice rules.
         """
         print("\n--- Distortion Comparisons ---")
+        
         rules_to_compare = ["plurality", "borda", "mcp", "random_dictatorship", "random_harm"] # Removed 'iod', 'ior' as they are not implemented
 
         for rule in rules_to_compare:
@@ -1079,7 +1276,7 @@ class Instance:
             print(f"    Running Time: {finish_t:.4f}")
         else:
             print(f"    Could not calculate distortion for {rule}.")
-
+            
         print(f"  Rule: uniform")
         uniform_c=np.ones(self.d)/self.d
         emp_dist = self.max_social_welfare * self.d / self.n
@@ -1088,22 +1285,46 @@ class Instance:
         print(f"    Theoretical Distortion: {theo_dist:.4f}")
 
 
-        print(f"  Rule: Generating unconstrained best choice")
+        print("Rule: UProj")
+        start_t=time.time()
+        uproj_c = self.uniform_project()        
+        finish_t=time.time()-start_t
+        if uproj_c is not None:
+            emp_dist = self.max_social_welfare / (self.voters @ uproj_c).sum()
+            theo_dist = self.calculate_theoretical_distortion(np.array(uproj_c))
+            print(f"    Running Time: {finish_t:.4f}")
+            print(f"    Empirical Distortion: {emp_dist:.4f}")
+            print(f"    Theoretical Distortion: {theo_dist:.4f}")
+
+        print(f" Rule: Linear Stable Lottery Rule (LSLR)")
+        start_t=time.time()
+        lslr_c = self.compute_linear_stable_lottery()
+        finish_t=time.time()-start_t
+        if lslr_c is not None:
+            emp_dist = self.max_social_welfare / (self.voters @ lslr_c).sum()
+            theo_dist = self.calculate_theoretical_distortion(np.array(lslr_c))
+            print(f"    Running Time: {finish_t:.4f}")
+            print(f"    Empirical Distortion: {emp_dist:.4f}")
+            print(f"    Theoretical Distortion: {theo_dist:.4f}")
+        else:
+            print(f"    Could not compute Linear Stable Lottery Rule (LSLR) candidate distribution.")
+
+
+        '''print(f"  Rule: Generating unconstrained best choice")
         start_t=time.time()  
         optimal_sw, optimal_c =self.solve_max_min_c_v_problem()
         r_t=time.time()-start_t
         print("optimal_sw,optimal_c",optimal_sw,optimal_c)
-        
         emp_dist = self.max_social_welfare / (self.voters @ optimal_c).sum()
-        if emp_dist is not None:
-            print(f"    Empirical Distortion: {emp_dist:.4f}")
-            print(f"    Running Time: {r_t:.4f}")   
-       
-        start_t_2=time.time()  
-        theo_dist=self.calculate_theoretical_distortion(np.array(optimal_c))
+        theo_dist= self.calculate_theoretical_distortion(np.array(optimal_c))
         theo_dist_r=self.calculate_theoretical_distortion_unconstrained(np.array(optimal_c))
-        theo_time=time.time()-start_t_2
-        print(f"    Theoretical Distortion: {theo_dist:.4f}")
-        print(f"    Theoretical Reverse Distortion: {theo_dist_r:.4f}")
-        print(f"    Theoretical Bound Calculating Time: {theo_time:.4f}")
+       
+        if emp_dist is not None and theo_dist is not None:
+            print(f"    Empirical Distortion: {emp_dist:.4f}")
+            print(f"    Theoretical Distortion: {theo_dist:.4f}")
+            print(f"    Theoretical Distortio Reverse: {theo_dist_r:.4f}")
+            print(f"    Running Time: {r_t:.4f}")
+            print(f"    Theoretical Bound Calculating Time: {theo_time:.4f}")
+        else:
+            print(f"    Could not calculate distortion for {rule}.")'''
         
