@@ -1,4 +1,4 @@
-This repo contains the code and data associated with paper Optimized Distortion in Linear Social Choice (https://arxiv.org/abs/2510.20020) accepted by AAAI 2026. 
+This repo contains the code and data associated with paper **Optimized Distortion in Linear Social Choice** (https://arxiv.org/abs/2510.20020) accepted by AAAI 2026. 
 
 If you use this code, please cite:
   @inproceeding{ge2025optimizeddistortionlinearsocial,
