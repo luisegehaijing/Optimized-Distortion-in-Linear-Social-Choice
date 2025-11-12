@@ -1169,24 +1169,4 @@ class Instance:
             print(f"    Theoretical Distortion: {theo_dist:.4f}")
         else:
             print(f"    Could not compute Linear Stable Lottery Rule (LSLR) candidate distribution.")
-
-'''
-        print(f"  Rule: Generating unconstrained best choice")
-        start_t=time.time()  
-        optimal_sw, optimal_c =self.solve_max_min_c_v_problem()
-        r_t=time.time()-start_t
-        print("optimal_sw,optimal_c",optimal_sw,optimal_c)
-        
-        emp_dist = self.max_social_welfare / (self.voters @ optimal_c).sum()
-        if emp_dist is not None:
-            print(f"    Empirical Distortion: {emp_dist:.4f}")
-            print(f"    Running Time: {r_t:.4f}")   
-       
-        start_t_2=time.time()  
-        theo_dist=self.calculate_theoretical_distortion(np.array(optimal_c))
-        theo_dist_r=self.calculate_theoretical_distortion_unconstrained(np.array(optimal_c))
-        theo_time=time.time()-start_t_2
-        print(f"    Theoretical Distortion: {theo_dist:.4f}")
-        print(f"    Theoretical Reverse Distortion: {theo_dist_r:.4f}")
-        print(f"    Theoretical Bound Calculating Time: {theo_time:.4f}")
-'''        
+   
